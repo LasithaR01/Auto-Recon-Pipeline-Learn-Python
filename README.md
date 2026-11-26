@@ -2,96 +2,71 @@
 
 Security Recon Pipeline built upon Python | Subfinder | HTTPX | Nmap | JSON Report
 
-> **Auto-Recon (v1.2)** — subdomain enum → HTTP probe → port scan → `report.json`  
-> Run: `python -m auto_recon` · Speed modes: `--fast` / default / `--deep`
+> **Auto-Recon (v2.1)** — advanced + extremely fast recon with v1/v2 APIs  
+> Run: `python -m auto_recon <domain> --fast`
 
-![Platform](https://img.shields.io/badge/platform-Windows%2011-blue)
-![Language](https://img.shields.io/badge/language-Python-green)
-![License](https://img.shields.io/badge/license-MIT-lightgrey)
-
-## Project structure
+## Structure
 
 ```text
-Auto-Recon-Pipeline-Learn-Python/
-├── README.md
-├── .gitignore
-├── auto_recon/
-│   ├── __init__.py
-│   ├── __main__.py          # python -m auto_recon
-│   ├── config.py            # Speed profiles (fast / balanced / deep)
-│   ├── env.py
-│   ├── ui.py
-│   ├── tools.py
-│   ├── dnsutil.py           # Reuse HTTPX IPs + parallel DNS fallback
-│   ├── phases.py
-│   ├── report.py
-│   └── cli.py
-└── recon_output/            # Created at runtime (gitignored)
+auto_recon/
+├── cli.py / config.py
+├── core/          # UI, tools, DNS, cache
+├── v1/            # recon pipeline → report.json
+└── v2/            # inventory, diff, scoring, dashboard, CSV, alerts
 ```
 
-## Speed modes (v1.2)
+## v2.1 upgrades
 
-| Mode | Flag | What changes |
-|------|------|----------------|
-| **fast** | `--fast` | Max threads, short timeouts, skip tech-detect & Nmap `-sV` |
-| **balanced** | *(default)* | Fast timeouts + light service detect |
-| **deep** | `--deep` | Richer fingerprints, slower / more accurate |
-
-Other speed wins (always on):
-- HTTPX `-ip` → reuse IPs, **skip redundant DNS** when possible
-- Parallel DNS only for hosts still missing an IP
-- Nmap `-n` (no DNS), `--min-rate`, capped retries
-- `--limit` (default 100) avoids huge CT-log floods
+| Feature | Why it matters |
+|---------|----------------|
+| **Subfinder cache** (30m TTL) | Re-runs finish in seconds |
+| **Port profiles** | `quick` / `web` / `db` / `admin` / `full` |
+| **Skip flags** | `--skip-subfinder` / `--skip-httpx` / `--skip-nmap` |
+| **HTML dashboard** | `dashboard.html` insight view |
+| **CSV export** | `assets.csv` for sheets / tooling |
+| **Faster defaults** | snappier balanced + aggressive `--fast` |
 
 ## Usage
 
 ```powershell
-cd "E:\Projects\Personal Projects\Auto-Recon-Pipeline-Learn-Python"
-
-# Extreme speed (recommended for quick labs)
+# Extreme speed (labs)
 python -m auto_recon example.com --fast --limit 30
 
-# Default balanced
-python -m auto_recon example.com --limit 50
+# Cached re-run (usually much faster)
+python -m auto_recon example.com --fast --limit 30
 
-# Thorough fingerprints
-python -m auto_recon example.com --deep --limit 50
+# Force fresh Subfinder
+python -m auto_recon example.com --fast --refresh
 
-python -m auto_recon example.com --fast --verbose
-python -m auto_recon example.com --fast --quiet
+# Port profiles
+python -m auto_recon example.com --fast --ports-profile quick
+python -m auto_recon example.com --deep --ports-profile full
+
+# Skip stages
+python -m auto_recon example.com --fast --skip-subfinder --ports-profile web
 ```
 
-Prefer **Administrator** PowerShell for Nmap/Npcap.  
-Only scan domains you **own** or have **written authorization** to test.
-
-## Prerequisites
-
-- Python 3.9+ (stdlib only)
-- Go + ProjectDiscovery tools in `%USERPROFILE%\go\bin`
-- Nmap with Npcap
+### Alerts (optional)
 
 ```powershell
-go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+$env:AUTO_RECON_SLACK_WEBHOOK = "https://hooks.slack.com/services/..."
+$env:AUTO_RECON_TEAMS_WEBHOOK = "https://outlook.office.com/webhook/..."
+python -m auto_recon example.com --fast
 ```
 
 ## Output
 
 ```text
 recon_output/<target>/
-  subdomains.txt
-  httpx.jsonl
-  nmap.xml
   report.json
+  inventory.json
+  changes.json / changes.md
+  dashboard.html
+  assets.csv
+  history/
+  .cache/subdomains.json
 ```
-
-## Roadmap
-
-- **v1.1** — professional CLI + modular package
-- **v1.2** — speed profiles (`--fast` / `--deep`), IP reuse, faster tool flags
-- **v2** — caching / resume, port profiles
-- **v3** — multi-target, HTML summary
 
 ## Disclaimer
 
-This tool is intended for **authorized security testing only**. Only scan domains you own or have explicit written permission to test. Unauthorized scanning may violate laws such as the CFAA (US) or Computer Misuse Act (UK). The author assumes no liability for misuse.
+Authorized testing only. Scan only domains you own or have written permission to test.

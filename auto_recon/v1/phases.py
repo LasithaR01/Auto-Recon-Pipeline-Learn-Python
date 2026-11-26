@@ -8,8 +8,9 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 from auto_recon.config import SpeedProfile
-from auto_recon.tools import run_cmd
-from auto_recon.ui import Ui
+from auto_recon.core.cache import load_subdomain_cache, save_subdomain_cache
+from auto_recon.core.tools import run_cmd
+from auto_recon.core.ui import Ui
 
 
 def ensure_priority_hosts(target: str, subdomains: list[str]) -> list[str]:
@@ -41,13 +42,29 @@ def phase_subfinder(
     out_dir: str,
     limit: int,
     profile: SpeedProfile,
+    *,
+    cache_ttl: int = 0,
+    force_refresh: bool = False,
 ) -> list[str]:
     """
     Theory: Subfinder is *passive* — it queries public sources.
     Speed: limited sources + shorter timeouts under --fast.
+    Cache: reuse prior subdomain lists within TTL (massive re-run speedup).
     """
     started = ui.phase_start(1, 3, "Subfinder", "enumerating subdomains…")
     subs_file = os.path.join(out_dir, "subdomains.txt")
+
+    if not force_refresh and cache_ttl > 0:
+        cached = load_subdomain_cache(out_dir, target=target, ttl_seconds=cache_ttl)
+        if cached:
+            unique = apply_limit(ui, target, cached, limit)
+            with open(subs_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(unique))
+                if unique:
+                    f.write("\n")
+            ui.phase_done("Subfinder", started, f"{len(unique)} hosts (cache hit)")
+            return unique
+
     cmd = [
         "subfinder",
         "-d",
@@ -85,6 +102,8 @@ def phase_subfinder(
             seen.add(key)
             unique.append(key)
 
+    # Cache full unique set before limit so later runs can re-limit differently.
+    save_subdomain_cache(out_dir, target=target, subdomains=unique)
     unique = apply_limit(ui, target, unique, limit)
 
     with open(subs_file, "w", encoding="utf-8") as f:

@@ -1,4 +1,4 @@
-"""CLI entry: argparse + pipeline orchestration."""
+"""CLI entry: argparse + pipeline orchestration (v2.1)."""
 
 from __future__ import annotations
 
@@ -8,22 +8,51 @@ import sys
 import time
 
 from auto_recon import APP_NAME, APP_VERSION
-from auto_recon.config import BALANCED, DEEP, DEFAULT_LIMIT, DEFAULT_PORTS, FAST
-from auto_recon.dnsutil import resolve_ips
-from auto_recon.phases import parse_nmap_xml, phase_httpx, phase_nmap, phase_subfinder
-from auto_recon.report import collect_open_ports, write_report
-from auto_recon.tools import require_tool, tool_version_line
-from auto_recon.ui import Ui
+from auto_recon.config import (
+    BALANCED,
+    DEEP,
+    DEFAULT_CACHE_TTL,
+    DEFAULT_LIMIT,
+    DEFAULT_PORTS,
+    FAST,
+    PORT_PROFILES,
+    resolve_ports,
+)
+from auto_recon.core.dns import resolve_ips
+from auto_recon.core.tools import require_tool, tool_version_line
+from auto_recon.core.ui import Ui
+from auto_recon.v1.phases import (
+    parse_nmap_xml,
+    phase_httpx,
+    phase_nmap,
+    phase_subfinder,
+)
+from auto_recon.v1.report import collect_open_ports, write_report
+from auto_recon.v2.alerts import dispatch_alerts, resolve_webhooks
+from auto_recon.v2.change_report import write_change_report
+from auto_recon.v2.dashboard import write_html_dashboard
+from auto_recon.v2.diffing import diff_inventories
+from auto_recon.v2.export_csv import write_inventory_csv
+from auto_recon.v2.inventory import (
+    build_inventory,
+    load_previous_inventory,
+    save_inventory,
+)
+from auto_recon.v2.scoring import score_changes, score_inventory
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m auto_recon",
         description=(
-            f"{APP_NAME} {APP_VERSION} — Subfinder → HTTPX → Nmap → JSON report"
+            f"{APP_NAME} {APP_VERSION} — fast recon + inventory + diff + dashboard"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="Only scan domains you own or have written authorization to test.",
+        epilog=(
+            "Authorized testing only. "
+            "Webhooks: AUTO_RECON_SLACK_WEBHOOK / AUTO_RECON_TEAMS_WEBHOOK. "
+            f"Port profiles: {', '.join(PORT_PROFILES)}"
+        ),
     )
     parser.add_argument("target", help="Bare domain, e.g. example.com")
     parser.add_argument(
@@ -34,19 +63,76 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ports",
-        default=DEFAULT_PORTS,
-        help="Nmap port list",
+        default=None,
+        help=f"Nmap port list (default web profile: {DEFAULT_PORTS})",
+    )
+    parser.add_argument(
+        "--ports-profile",
+        choices=sorted(PORT_PROFILES.keys()),
+        default=None,
+        help="Named port set: quick|web|db|admin|full",
     )
     speed = parser.add_mutually_exclusive_group()
     speed.add_argument(
         "--fast",
         action="store_true",
-        help="Extreme speed: skip tech/version detect, aggressive timeouts",
+        help="Extreme speed preset (recommended for labs)",
     )
     speed.add_argument(
         "--deep",
         action="store_true",
         help="Thorough mode: richer fingerprints, slower",
+    )
+    parser.add_argument(
+        "--cache-ttl",
+        type=int,
+        default=DEFAULT_CACHE_TTL,
+        help="Reuse Subfinder cache for N seconds (0 disables)",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Ignore Subfinder cache and re-enumerate",
+    )
+    parser.add_argument(
+        "--skip-subfinder",
+        action="store_true",
+        help="Reuse existing subdomains.txt only (no Subfinder call)",
+    )
+    parser.add_argument(
+        "--skip-httpx",
+        action="store_true",
+        help="Skip HTTP probing",
+    )
+    parser.add_argument(
+        "--skip-nmap",
+        action="store_true",
+        help="Skip port scanning",
+    )
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Do not write dashboard.html",
+    )
+    parser.add_argument(
+        "--no-csv",
+        action="store_true",
+        help="Do not write assets.csv",
+    )
+    parser.add_argument(
+        "--slack-webhook",
+        default=None,
+        help="Slack incoming webhook URL (overrides env)",
+    )
+    parser.add_argument(
+        "--teams-webhook",
+        default=None,
+        help="Teams incoming webhook URL (overrides env)",
+    )
+    parser.add_argument(
+        "--no-alert",
+        action="store_true",
+        help="Do not send Slack/Teams alerts even if webhooks are set",
     )
     parser.add_argument(
         "--verbose",
@@ -65,6 +151,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable ANSI colors",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{APP_NAME} {APP_VERSION}",
+    )
     return parser.parse_args()
 
 
@@ -74,6 +165,108 @@ def select_profile(args: argparse.Namespace):
     if args.deep:
         return DEEP
     return BALANCED
+
+
+def _load_existing_subdomains(out_dir: str) -> list[str]:
+    path = os.path.join(out_dir, "subdomains.txt")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [line.strip().lower() for line in f if line.strip()]
+
+
+def _run_v2_postprocess(
+    ui: Ui,
+    *,
+    target: str,
+    out_dir: str,
+    subdomains: list[str],
+    live_hosts: list,
+    nmap_findings: dict,
+    profile_name: str,
+    args: argparse.Namespace,
+) -> dict:
+    """Inventory → diff → score → exports → optional alerts."""
+    previous = load_previous_inventory(out_dir)
+    inventory = build_inventory(
+        target=target,
+        subdomains=subdomains,
+        live_hosts=live_hosts,
+        nmap_findings=nmap_findings,
+        profile=profile_name,
+    )
+    changes = diff_inventories(previous, inventory)
+    inv_scores = score_inventory(inventory)
+    chg_scores = score_changes(changes)
+
+    inventory["scoring"] = {
+        "overall_score": inv_scores["overall_score"],
+        "max_severity": inv_scores["max_severity"],
+    }
+    inv_path = save_inventory(out_dir, inventory)
+    changes_json, changes_md = write_change_report(
+        out_dir,
+        target=target,
+        changes=changes,
+        inventory_scores=inv_scores,
+        change_scores=chg_scores,
+    )
+
+    dashboard_path = None
+    if not args.no_dashboard:
+        dashboard_path = write_html_dashboard(
+            out_dir,
+            target=target,
+            inventory=inventory,
+            changes=changes,
+            inventory_scores=inv_scores,
+            change_scores=chg_scores,
+        )
+
+    csv_path = None
+    if not args.no_csv:
+        csv_path = write_inventory_csv(out_dir, inventory)
+
+    alert_results: list[dict[str, str]] = []
+    if not args.no_alert:
+        hooks = resolve_webhooks(args.slack_webhook, args.teams_webhook)
+        alert_results = dispatch_alerts(
+            target=target,
+            changes=changes,
+            change_scores=chg_scores,
+            webhooks=hooks,
+        )
+
+    if not ui.quiet:
+        if changes.get("baseline"):
+            ui.info("v2: baseline inventory saved (no previous scan to diff)")
+        else:
+            summary = changes.get("summary") or {}
+            ui.info(
+                "v2: change since last scan — "
+                f"new hosts={summary.get('new_live_hosts', 0)}, "
+                f"new ports={summary.get('new_ports', 0)}, "
+                f"severity={chg_scores.get('max_severity')}"
+            )
+        if dashboard_path:
+            ui.info(f"dashboard → {dashboard_path}")
+        for row in alert_results:
+            if row["status"] == "ok":
+                ui.ok(f"Alert sent → {row['channel']}")
+            else:
+                ui.warn(f"Alert failed → {row['channel']}: {row['detail']}")
+
+    return {
+        "inventory_path": inv_path,
+        "changes_json": changes_json,
+        "changes_md": changes_md,
+        "dashboard_path": dashboard_path,
+        "csv_path": csv_path,
+        "inventory_scores": inv_scores,
+        "change_scores": chg_scores,
+        "changes": changes,
+        "alert_results": alert_results,
+    }
 
 
 def main() -> None:
@@ -90,7 +283,20 @@ def main() -> None:
         ui.err("Pass a bare domain only, e.g. example.com")
         sys.exit(1)
 
-    for tool in ("subfinder", "httpx", "nmap"):
+    try:
+        ports = resolve_ports(args.ports, args.ports_profile)
+    except ValueError as exc:
+        ui.err(str(exc))
+        sys.exit(2)
+
+    needed = []
+    if not args.skip_subfinder:
+        needed.append("subfinder")
+    if not args.skip_httpx:
+        needed.append("httpx")
+    if not args.skip_nmap:
+        needed.append("nmap")
+    for tool in needed:
         require_tool(ui, tool)
 
     out_dir = os.path.join("recon_output", target)
@@ -99,6 +305,8 @@ def main() -> None:
     ui.banner(target, args.limit, profile=profile.name)
     if not ui.quiet and ui.verbose:
         ui.info(f"Output: {out_dir}")
+        ui.info(f"Ports: {ports}")
+        ui.info(f"Cache TTL: {args.cache_ttl}s  refresh={args.refresh}")
         ui.info(
             f"Profile: {profile.name} "
             f"(httpx={profile.httpx_threads}t/{profile.httpx_timeout}s, "
@@ -110,27 +318,60 @@ def main() -> None:
 
     total_started = time.perf_counter()
     try:
-        subdomains = phase_subfinder(ui, target, out_dir, args.limit, profile)
+        if args.skip_subfinder:
+            started = ui.phase_start(1, 3, "Subfinder", "skipped (reuse file)…")
+            subdomains = _load_existing_subdomains(out_dir)
+            ui.phase_done("Subfinder", started, f"{len(subdomains)} hosts (file)")
+        else:
+            subdomains = phase_subfinder(
+                ui,
+                target,
+                out_dir,
+                args.limit,
+                profile,
+                cache_ttl=args.cache_ttl,
+                force_refresh=args.refresh,
+            )
+
+        live_hosts: list = []
+        ips: set[str] = set()
+        nmap_findings: dict = {}
+
         if not subdomains:
-            ui.warn("No subdomains found — pipeline stops here.")
-            report_path = write_report(
-                target, out_dir, [], [], {}, profile=profile.name
-            )
-            ui.summary(
-                subdomains=0,
-                live_hosts=0,
-                ips=0,
-                open_ports=[],
-                report_path=report_path,
-            )
-            sys.exit(0)
+            ui.warn("No subdomains found — still writing v2 artifacts.")
+        else:
+            subs_file = os.path.join(out_dir, "subdomains.txt")
+            if args.skip_httpx:
+                started = ui.phase_start(2, 3, "HTTPX", "skipped…")
+                ui.phase_done("HTTPX", started, "skipped")
+            else:
+                live_hosts = phase_httpx(ui, subs_file, out_dir, profile)
+                ips = resolve_ips(live_hosts)
 
-        subs_file = os.path.join(out_dir, "subdomains.txt")
-        live_hosts = phase_httpx(ui, subs_file, out_dir, profile)
-        ips = resolve_ips(live_hosts)
+            if args.skip_nmap:
+                started = ui.phase_start(3, 3, "Nmap", "skipped…")
+                ui.phase_done("Nmap", started, "skipped")
+            else:
+                if not ips:
+                    # From httpx results, or a tiny stub list if httpx was skipped.
+                    seed = live_hosts or [{"host": s} for s in subdomains[:5]]
+                    ips = resolve_ips(seed)
+                nmap_xml = phase_nmap(
+                    ui, ips, out_dir, ports=ports, profile=profile
+                )
+                nmap_findings = parse_nmap_xml(nmap_xml)
 
-        nmap_xml = phase_nmap(ui, ips, out_dir, ports=args.ports, profile=profile)
-        nmap_findings = parse_nmap_xml(nmap_xml)
+        v2 = _run_v2_postprocess(
+            ui,
+            target=target,
+            out_dir=out_dir,
+            subdomains=subdomains,
+            live_hosts=live_hosts,
+            nmap_findings=nmap_findings,
+            profile_name=profile.name,
+            args=args,
+        )
+
         report_path = write_report(
             target,
             out_dir,
@@ -138,7 +379,36 @@ def main() -> None:
             live_hosts,
             nmap_findings,
             profile=profile.name,
+            extra={
+                "v2": {
+                    "inventory": "inventory.json",
+                    "changes": "changes.json",
+                    "changes_md": "changes.md",
+                    "dashboard": "dashboard.html" if v2.get("dashboard_path") else None,
+                    "csv": "assets.csv" if v2.get("csv_path") else None,
+                    "overall_severity": v2["inventory_scores"].get("max_severity"),
+                    "overall_score": v2["inventory_scores"].get("overall_score"),
+                    "change_severity": v2["change_scores"].get("max_severity"),
+                    "change_score": v2["change_scores"].get("change_score"),
+                    "baseline": bool(v2["changes"].get("baseline")),
+                }
+            },
         )
+
+        extra = [
+            (
+                "Severity",
+                f"{v2['inventory_scores'].get('max_severity')} "
+                f"({v2['inventory_scores'].get('overall_score')})",
+            ),
+            ("Inventory", v2["inventory_path"]),
+            ("Changes", v2["changes_json"]),
+            ("Change MD", v2["changes_md"]),
+        ]
+        if v2.get("dashboard_path"):
+            extra.append(("Dashboard", v2["dashboard_path"]))
+        if v2.get("csv_path"):
+            extra.append(("CSV", v2["csv_path"]))
 
         ui.summary(
             subdomains=len(subdomains),
@@ -146,10 +416,11 @@ def main() -> None:
             ips=len(ips),
             open_ports=collect_open_ports(nmap_findings),
             report_path=report_path,
+            extra_rows=extra,
         )
         if not ui.quiet:
             total = time.perf_counter() - total_started
-            ui.ok(f"Total runtime {total:.1f}s  [{profile.name}]")
+            ui.ok(f"Total runtime {total:.1f}s  [{profile.name}]  {APP_VERSION}")
             print()
     except KeyboardInterrupt:
         print()

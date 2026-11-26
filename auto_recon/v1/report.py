@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 from auto_recon import APP_VERSION
-from auto_recon.env import detect_environment
+from auto_recon.core.env import detect_environment
 
 
 def collect_open_ports(nmap_findings: dict[str, list[dict[str, str]]]) -> list[str]:
@@ -27,6 +28,7 @@ def write_report(
     live_hosts: list[dict[str, Any]],
     nmap_findings: dict[str, list[dict[str, str]]],
     profile: str = "balanced",
+    extra: dict[str, Any] | None = None,
 ) -> str:
     """Assemble the single JSON artifact that later versions can extend."""
     # Drop bulky raw DNS arrays from the final report for cleaner/faster writes.
@@ -36,10 +38,11 @@ def write_report(
             {k: v for k, v in h.items() if k not in ("a", "aaaa")}
         )
 
-    report = {
+    report: dict[str, Any] = {
         "target": target,
         "version": APP_VERSION,
         "profile": profile,
+        "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "environment": detect_environment(),
         "total_subdomains": len(subdomains),
         "total_live_hosts": len(live_hosts),
@@ -47,6 +50,8 @@ def write_report(
         "live_hosts": slim_hosts,
         "nmap_findings": nmap_findings,
     }
+    if extra:
+        report.update(extra)
 
     report_path = os.path.join(out_dir, "report.json")
     with open(report_path, "w", encoding="utf-8") as f:

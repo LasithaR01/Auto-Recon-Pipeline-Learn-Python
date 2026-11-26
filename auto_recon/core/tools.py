@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 
-from auto_recon.ui import Ui
+from auto_recon.core.ui import Ui
 
 
 def require_tool(ui: Ui, name: str) -> None:
