@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from auto_recon import APP_NAME, APP_VERSION
-from auto_recon.env import detect_environment
+from auto_recon.core.env import detect_environment
 
 
 def _enable_windows_ansi() -> None:
@@ -139,6 +139,7 @@ class Ui:
         ips: int,
         open_ports: list[str],
         report_path: str,
+        extra_rows: list[tuple[str, str]] | None = None,
     ) -> None:
         if self.quiet:
             print(report_path)
@@ -146,13 +147,23 @@ class Ui:
         ports_label = ", ".join(open_ports) if open_ports else "none"
         print()
         print(f"  {self.bold('── Summary ' + '─' * 28)}")
-        rows = [
+        rows: list[tuple[str, str]] = [
             ("Subdomains", str(subdomains)),
             ("Live hosts", str(live_hosts)),
             ("Unique IPs", str(ips)),
             ("Open ports", ports_label),
             ("Report", report_path),
         ]
+        if extra_rows:
+            rows.extend(extra_rows)
+        path_keys = {
+            "Report",
+            "Inventory",
+            "Changes",
+            "Change MD",
+            "Dashboard",
+            "CSV",
+        }
         for key, val in rows:
-            print(f"  {key:<12} {self.green(val) if key != 'Report' else val}")
+            print(f"  {key:<12} {self.green(val) if key not in path_keys else val}")
         print()
