@@ -39,18 +39,22 @@ from auto_recon.v2.inventory import (
     save_inventory,
 )
 from auto_recon.v2.scoring import score_changes, score_inventory
+from auto_recon.v3.alerts_bridge import alert_uptime_down
+from auto_recon.v3.platform import run_platform
+from auto_recon.v3.uptime import watch_uptime
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m auto_recon",
         description=(
-            f"{APP_NAME} {APP_VERSION} — fast recon + inventory + diff + dashboard"
+            f"{APP_NAME} {APP_VERSION} — Continuous Exposure Platform "
+            "(v1 recon + v2 insight + v3 monitoring)"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
-            "Authorized testing only. "
-            "Webhooks: AUTO_RECON_SLACK_WEBHOOK / AUTO_RECON_TEAMS_WEBHOOK. "
+            "Authorized testing only. Lean principle: only controls that change risk posture. "
+            "Webhooks: AUTO_RECON_SLACK_WEBHOOK / AUTO_RECON_TEAMS_WEBHOOK / AUTO_RECON_TICKET_WEBHOOK. "
             f"Port profiles: {', '.join(PORT_PROFILES)}"
         ),
     )
@@ -133,6 +137,49 @@ def parse_args() -> argparse.Namespace:
         "--no-alert",
         action="store_true",
         help="Do not send Slack/Teams alerts even if webhooks are set",
+    )
+    parser.add_argument(
+        "--platform",
+        action="store_true",
+        default=True,
+        help="Enable v3 Continuous Exposure Platform (default on)",
+    )
+    parser.add_argument(
+        "--no-platform",
+        action="store_true",
+        help="Disable v3 platform pack",
+    )
+    parser.add_argument(
+        "--tenant",
+        default="default",
+        help="Multi-tenant id for v3 platform",
+    )
+    parser.add_argument(
+        "--owner",
+        default=None,
+        help="Asset owner for ownership mapping / tickets",
+    )
+    parser.add_argument(
+        "--ticket-webhook",
+        default=None,
+        help="POST open SLA tickets JSON here (or AUTO_RECON_TICKET_WEBHOOK)",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Continuous uptime watch loop after scan (v3)",
+    )
+    parser.add_argument(
+        "--watch-interval",
+        type=float,
+        default=15.0,
+        help="Uptime poll seconds (1 = every second; prefer 15–60 in prod)",
+    )
+    parser.add_argument(
+        "--watch-ticks",
+        type=int,
+        default=0,
+        help="Stop watch after N ticks (0 = until Ctrl+C)",
     )
     parser.add_argument(
         "--verbose",
@@ -237,6 +284,32 @@ def _run_v2_postprocess(
             webhooks=hooks,
         )
 
+    platform = None
+    enable_platform = bool(args.platform) and not bool(getattr(args, "no_platform", False))
+    if enable_platform:
+        ticket_hook = args.ticket_webhook or os.environ.get(
+            "AUTO_RECON_TICKET_WEBHOOK", ""
+        ).strip() or None
+        started = ui.phase_start(4, 4, "Platform", "v3 continuous exposure…")
+        platform = run_platform(
+            out_dir,
+            target=target,
+            tenant_id=args.tenant,
+            owner=args.owner,
+            live_hosts=live_hosts,
+            nmap_findings=nmap_findings,
+            inventory=inventory,
+            inventory_scores=inv_scores,
+            ticket_webhook=ticket_hook,
+        )
+        risk = platform.get("exposure_risk") or {}
+        ui.phase_done(
+            "Platform",
+            started,
+            f"risk={risk.get('level')} score={risk.get('exposure_risk_score')} "
+            f"sla_fail={platform.get('sla_failing')} tickets={platform.get('tickets_open')}",
+        )
+
     if not ui.quiet:
         if changes.get("baseline"):
             ui.info("v2: baseline inventory saved (no previous scan to diff)")
@@ -250,6 +323,8 @@ def _run_v2_postprocess(
             )
         if dashboard_path:
             ui.info(f"dashboard → {dashboard_path}")
+        if platform and platform.get("executive_path"):
+            ui.info(f"executive → {platform['executive_path']}")
         for row in alert_results:
             if row["status"] == "ok":
                 ui.ok(f"Alert sent → {row['channel']}")
@@ -257,6 +332,7 @@ def _run_v2_postprocess(
                 ui.warn(f"Alert failed → {row['channel']}: {row['detail']}")
 
     return {
+        "inventory": inventory,
         "inventory_path": inv_path,
         "changes_json": changes_json,
         "changes_md": changes_md,
@@ -266,6 +342,7 @@ def _run_v2_postprocess(
         "change_scores": chg_scores,
         "changes": changes,
         "alert_results": alert_results,
+        "platform": platform,
     }
 
 
@@ -395,6 +472,8 @@ def main() -> None:
             },
         )
 
+        plat = v2.get("platform") or {}
+        risk = plat.get("exposure_risk") or {}
         extra = [
             (
                 "Severity",
@@ -409,6 +488,21 @@ def main() -> None:
             extra.append(("Dashboard", v2["dashboard_path"]))
         if v2.get("csv_path"):
             extra.append(("CSV", v2["csv_path"]))
+        if plat:
+            extra.extend(
+                [
+                    (
+                        "Risk",
+                        f"{risk.get('level')} ({risk.get('exposure_risk_score')})",
+                    ),
+                    ("Monitor", (plat.get("monitor") or {}).get("paths", {}).get("json", "")),
+                    ("Executive", plat.get("executive_path") or ""),
+                    ("Platform", plat.get("platform_path") or ""),
+                    ("Graph", plat.get("graph_path") or ""),
+                    ("SLA", plat.get("sla_path") or ""),
+                    ("Tickets", plat.get("tickets_path") or ""),
+                ]
+            )
 
         ui.summary(
             subdomains=len(subdomains),
@@ -422,6 +516,40 @@ def main() -> None:
             total = time.perf_counter() - total_started
             ui.ok(f"Total runtime {total:.1f}s  [{profile.name}]  {APP_VERSION}")
             print()
+
+        if args.watch:
+            ui.info(
+                f"v3 watch: uptime every {args.watch_interval}s "
+                "(Ctrl+C to stop)"
+            )
+
+            def _tick(snap: dict) -> None:
+                state = "UP" if snap.get("overall_up") else "DOWN"
+                ui.info(f"uptime {state}  {snap.get('up_count')}/{snap.get('checked')}")
+
+            def _down(snap: dict) -> None:
+                ui.warn("uptime DOWN — sending alerts if configured")
+                if not args.no_alert:
+                    for row in alert_uptime_down(
+                        target,
+                        snap,
+                        slack=args.slack_webhook,
+                        teams=args.teams_webhook,
+                    ):
+                        if row["status"] == "ok":
+                            ui.ok(f"Uptime alert → {row['channel']}")
+                        else:
+                            ui.warn(f"Uptime alert failed → {row['channel']}")
+
+            watch_uptime(
+                target,
+                out_dir,
+                interval=args.watch_interval,
+                live_hosts=live_hosts,
+                on_tick=_tick,
+                on_down=_down,
+                max_ticks=(args.watch_ticks or None),
+            )
     except KeyboardInterrupt:
         print()
         ui.warn("Cancelled by user.")
