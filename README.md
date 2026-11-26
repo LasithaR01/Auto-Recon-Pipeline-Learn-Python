@@ -2,70 +2,78 @@
 
 Security Recon Pipeline built upon Python | Subfinder | HTTPX | Nmap | JSON Report
 
-> **Auto-Recon (v2.1)** — advanced + extremely fast recon with v1/v2 APIs  
-> Run: `python -m auto_recon <domain> --fast`
+> **Auto-Recon (v3.0) — Continuous Exposure Platform**  
+> v1 discover → v2 diff/inventory → v3 uptime / health / posture / SLA / executive  
+> Lean principle: **only controls that change risk posture**  
+> Run: `python -m auto_recon yourdomain.com --fast`
 
 ## Structure
 
 ```text
 auto_recon/
-├── cli.py / config.py
-├── core/          # UI, tools, DNS, cache
-├── v1/            # recon pipeline → report.json
-└── v2/            # inventory, diff, scoring, dashboard, CSV, alerts
+├── core/     # UI, tools, DNS, cache
+├── v1/       # Subfinder → HTTPX → Nmap → report.json
+├── v2/       # inventory, diff, scoring, dashboard, CSV, alerts
+└── v3/       # Continuous Exposure Platform
+    ├── uptime / health / posture / risk_score
+    ├── tenants / graph / ownership / sla / tickets
+    ├── monitor / platform / executive
 ```
 
-## v2.1 upgrades
+## What each version is for
 
-| Feature | Why it matters |
-|---------|----------------|
-| **Subfinder cache** (30m TTL) | Re-runs finish in seconds |
-| **Port profiles** | `quick` / `web` / `db` / `admin` / `full` |
-| **Skip flags** | `--skip-subfinder` / `--skip-httpx` / `--skip-nmap` |
-| **HTML dashboard** | `dashboard.html` insight view |
-| **CSV export** | `assets.csv` for sheets / tooling |
-| **Faster defaults** | snappier balanced + aggressive `--fast` |
+| Version | Purpose |
+|---------|---------|
+| **v1** | Discover attack surface now |
+| **v2** | Inventory + change since last scan |
+| **v3** | Continuous exposure: uptime, broken pages/SEO, login surfaces, hardening signals, exposure risk score, multi-tenant, asset graph, ownership, SLA, tickets, executive dashboard |
+
+**Important:** v3 is **defensive monitoring / posture**. It is **not** a full vuln scanner, malware AV, or “can hack this site” exploit engine. The risk score estimates **exposure / hardening gaps**.
 
 ## Usage
 
 ```powershell
-# Extreme speed (labs)
-python -m auto_recon example.com --fast --limit 30
+# Full platform (v1+v2+v3) on YOUR site
+python -m auto_recon yourdomain.com --fast --tenant acme --owner "sec-team"
 
-# Cached re-run (usually much faster)
-python -m auto_recon example.com --fast --limit 30
+# Continuous uptime watch (1s interval lab; prefer 15–60s in prod)
+python -m auto_recon yourdomain.com --fast --watch --watch-interval 1 --watch-ticks 5
 
-# Force fresh Subfinder
-python -m auto_recon example.com --fast --refresh
-
-# Port profiles
-python -m auto_recon example.com --fast --ports-profile quick
-python -m auto_recon example.com --deep --ports-profile full
-
-# Skip stages
-python -m auto_recon example.com --fast --skip-subfinder --ports-profile web
+# Skip platform pack
+python -m auto_recon yourdomain.com --fast --no-platform
 ```
 
-### Alerts (optional)
+### Alerts / tickets (optional)
 
 ```powershell
 $env:AUTO_RECON_SLACK_WEBHOOK = "https://hooks.slack.com/services/..."
 $env:AUTO_RECON_TEAMS_WEBHOOK = "https://outlook.office.com/webhook/..."
-python -m auto_recon example.com --fast
+$env:AUTO_RECON_TICKET_WEBHOOK = "https://your-ticket-ingest.example/hooks"
 ```
 
-## Output
+## Output (v3)
 
 ```text
 recon_output/<target>/
-  report.json
-  inventory.json
-  changes.json / changes.md
-  dashboard.html
-  assets.csv
-  history/
-  .cache/subdomains.json
+  report.json / inventory.json / changes.* / dashboard.html / assets.csv
+  uptime.json / uptime_history.jsonl
+  monitor.json / monitor.md
+  asset_graph.json
+  ownership.json
+  sla.json
+  tickets.json
+  platform.json
+  executive.html          ← leadership view
 ```
+
+## Lean SLA controls (risk posture only)
+
+1. Public availability (uptime)  
+2. No high-risk edge ports  
+3. Fix broken customer pages  
+4. Baseline security headers  
+
+Failed controls → open tickets (file + optional webhook).
 
 ## Disclaimer
 

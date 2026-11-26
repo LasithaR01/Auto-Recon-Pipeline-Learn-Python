@@ -163,6 +163,12 @@ class Ui:
             "Change MD",
             "Dashboard",
             "CSV",
+            "Monitor",
+            "Executive",
+            "Platform",
+            "Graph",
+            "SLA",
+            "Tickets",
         }
         for key, val in rows:
             print(f"  {key:<12} {self.green(val) if key not in path_keys else val}")
